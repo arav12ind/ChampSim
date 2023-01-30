@@ -22,10 +22,22 @@ using std::cin;
 using std::hex;
 using std::dec;
 
-static const uint64_t blk_mask=~((static_cast<uint64_t>(1)<<LOG2_BLOCK_SIZE)-1);
 
+//* Mask to get the first address in a block.
+static const uint64_t blk_mask=~((static_cast<uint64_t>(1)<<LOG2_BLOCK_SIZE)-1);
+/*****************************************************************************************************************************/
 class idx_entry
 {
+  /**
+  * @param tag used searching in the set.
+  * @param last_addr it is the latest address asked by the instruction this entry is associated with.
+  * @param last_prefetch it is the last address for which prefetching was requested.
+  * @param delta_mask it has the largest number representable given n bits for representing a delta.
+  * @param n number of bits per deltas entry.
+  * @param deltas a circular buffer of deltas.
+  * @param delta_bits number of bits per delta.
+  * @param valid tells if this entry is valid in the set.
+  */
     public:
     uint64_t tag,last_addr,last_prefetch;
     uint64_t delta_mask;
@@ -59,35 +71,47 @@ class idx_entry
       this->deltas=x.deltas;
       this->n=x.n;
     }
+    /**
+     * Add a new address into the deltas.
+    */
     void insert(uint64_t addr)
     {
       std::int64_t delta=(std::int64_t)(addr-last_addr);
+      /**
+       * If It is an overflow set push 0 to circular buffer;
+      */
       if(delta>delta_mask)
         deltas.push_back(0);
+      /**
+       * Ignore when addr == last_addr;
+      */
       else if(delta!=0)
         deltas.push_back(delta);
-      // cout<<delta<<"\n";
-      
-      // cout<<hex<<tag<<dec<<" --  ";
-      // for(const auto &x:deltas)
-      // {
-      //   cout<<x<<" ";
-      // }
-      // cout<<"\n";
       last_addr=addr;
     }
-    boost::circular_buffer<std::int64_t>::iterator find_deltas(int i)
-    {
-      return std::search(deltas.begin(),deltas.end()-i,deltas.end()-i,deltas.end());
-    }
+
+    /**
+     * Algorithm requires use of latest few deltas, say i of them, in the circular buffer.
+     * It searches for the occurance of the latest i deltas in the delta sequence before the last i deltas.
+     * If found, the sequence after can be cadidates for prefetch.
+     * @param i is the latest few deltas used for searching.
+     * @param pf is an output variable for giving a list of prefetch candidates.
+     * 
+    */
     void get_prefetch_addresses(std::list<uint64_t> &pf,int i)
     {
+      //* At least 2*i deltas should be there for the last i deltas to repeat.
       if(deltas.size()<2*i)
         return;
+      /**
+       * Search the deltas for the last i deltas in reverse direction.
+      */
       auto dts=std::search(deltas.rbegin()+i,deltas.rend(),deltas.rbegin(),deltas.rbegin()+i);
+      //* If delta sequence repetition found.
       if(dts!=deltas.rend())
       {
         uint64_t pf_addr=last_addr;
+        //* Generate the addresses and have only one address representing each cache block.
         for(auto it=deltas.rbegin()+i;it!=dts;++it)
         {
           pf_addr+=*it;
@@ -97,13 +121,13 @@ class idx_entry
           }
           else
           {
+            //* Find if another prefetch candidate belongs to the same cache block.
             auto same_blk=[pf_addr](uint64_t ad){
               return (pf_addr&blk_mask)==(ad&blk_mask);};
             auto dup=std::find_if(pf.begin(),pf.end(),same_blk);
             if(dup==pf.end())
             {
               pf.push_back(pf_addr);
-              last_prefetch=pf_addr;
             }
           }
         }
@@ -120,6 +144,8 @@ class idx_entry
     }
 };
 
+
+//* Abstract Base class for index table sets.
 class idx_set
 {
     protected:
@@ -168,6 +194,8 @@ class lru_idx_set : public idx_set
           return it;
       return idx_entries.end();
     }
+
+    //* Puts the element at the end of the list. The farther the element from the head the more recent it has been accessed.
     virtual void access(std::list<idx_entry>::iterator it) override
     {
         idx_entries.splice(idx_entries.end(),idx_entries,it);
@@ -176,7 +204,7 @@ class lru_idx_set : public idx_set
     {
       return it==idx_entries.end();
     }
-
+    //* Assumes the entry ent is not in this set. Use find before the function to check.
     virtual void insert(const idx_entry &ent,std::list<idx_entry>::iterator &it) override
     {
       //* Re-use the node that is being replaced.
@@ -202,8 +230,7 @@ class lru_idx_set : public idx_set
 };
 const string lru_idx_set::replacement_algo = "LRU";
 
-
-//* Seperated from the cache class for making a vector of caches.
+/*****************************************************************************************************************************/
 template<class idx_set>
 class IndexTable
 {
@@ -215,6 +242,8 @@ class IndexTable
     * @param set_mask for getting only the index portion of the address.
     * @param tag_mask for getting only the tag portion of the address.
     * @param addr_bits address length.
+    * @param *c points to the cache this table is associated with.
+    * @param no_of_deltas_to_search The no. of latest few deltas to seach in the circular buffer of deltas.
     */
     protected:
     const string name,replacement_algo;
@@ -276,6 +305,8 @@ class IndexTable
     {
         return addr&(tag_mask+set_mask);
     }
+
+    //* Checks if the block containing ad is in cache.
     bool in_cache(uint64_t ad)
     {
         auto set_no = c->get_set(ad);
@@ -286,6 +317,8 @@ class IndexTable
         else 
           return false;
     }
+
+    //* Used to check of the address's cache block is in any of the queues.
     template<class Iterator>
     bool is_in(const Iterator &begin,const Iterator &end,uint64_t ad)
     {
@@ -322,28 +355,33 @@ class IndexTable
       //cout<<"\nSet no : "<<set_no<<"  Blk_addr : "<<blk_addr;
       uint64_t tag   = pc;
       auto it=sets[set_no].find(tag);
+      //* If the PC value is new create a new entry.
       if(sets[set_no].is_end(it))
       {
         idx_entry ent(tag,addr,delta_bits,true,n);
         sets[set_no].insert(ent,it);
       }
+      //* If not then update the entry if the miss address is not the same as before.
       else if(addr!=it->last_addr)
       {
         it->insert(addr);
         sets[set_no].access(it);
-        
+        //* Search for the last
         it->get_prefetch_addresses(candidates,no_of_deltas_to_search);
         prefetch_filter(candidates);
-        it->last_prefetch=*std::prev(candidates.end());
+        if(not candidates.empty())
+          it->last_prefetch=*std::prev(candidates.end());
       }
       return candidates;
     }
 
 };
-
-//(const string &name,const string &replacement_algo,const uint no_of_sets,const uint ways,const uint blk_size,const uint n,const uint delta_bits,const uint no_of_deltas_to_search)
+/*****************************************************************************************************************************/
+//* Maps a cache to it's DCPT.
 std::map<CACHE*,IndexTable<lru_idx_set>*> dcpts;
+/*****************************************************************************************************************************/
 
+//* Creates a DCPT for itself.
 void CACHE::prefetcher_initialize()
 {
   std::cout << NAME << " Delta Correlating Prefetcher\n";
@@ -354,6 +392,7 @@ void CACHE::prefetcher_cycle_operate(){}
 
 uint32_t CACHE::prefetcher_cache_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
 {
+  //* DCPT is trained on demand access misses.
   if(cache_hit==0 and type!=PREFETCH)
   {
     
@@ -371,6 +410,7 @@ uint32_t CACHE::prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way,
   return metadata_in;
 }
 
+//* Destroy the DCPT
 void CACHE::prefetcher_final_stats() {
   delete dcpts[this];
   dcpts.erase(this);
